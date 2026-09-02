@@ -237,3 +237,51 @@ def test_skill_toolkit_normalizes_selected_single_agent_aliases():
     assert agent_skill_toolkit._is_agent_allowed(
         "demo", "single_agent", config
     )
+
+
+def test_concurrent_skill_config_updates_keep_every_delta(
+    tmp_path, monkeypatch
+):
+    import threading
+    import time
+
+    eigent_root = tmp_path / "home" / ".eigent"
+    monkeypatch.setattr(skill_config_service, "EIGENT_ROOT", eigent_root)
+
+    original_read = skill_config_service._read_config_file
+
+    def slow_read(path):
+        data = original_read(path)
+        time.sleep(0.05)
+        return data
+
+    monkeypatch.setattr(skill_config_service, "_read_config_file", slow_read)
+
+    skill_config_service.skill_config_load("user_7")
+    names = ["alpha", "beta", "gamma"]
+    errors: list[BaseException] = []
+
+    def update(name: str) -> None:
+        try:
+            skill_config_service.skill_config_update(
+                "user_7",
+                name,
+                {
+                    "enabled": False,
+                    "scope": {"isGlobal": True, "selectedAgents": []},
+                },
+            )
+        except BaseException as error:  # pragma: no cover - surfaced below
+            errors.append(error)
+
+    threads = [threading.Thread(target=update, args=(name,)) for name in names]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+
+    assert errors == []
+    config = skill_config_service.skill_config_load("user_7")
+    assert set(config["skills"]) >= set(names)
+    for name in names:
+        assert config["skills"][name]["enabled"] is False

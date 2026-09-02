@@ -16,9 +16,14 @@
 
 import json
 import logging
+import os
 import re
 import shutil
+import tempfile
+import threading
 import time
+import weakref
+from contextlib import contextmanager
 from pathlib import Path
 
 from app.service.skill_service import (
@@ -30,6 +35,58 @@ logger = logging.getLogger("skill_config")
 
 EIGENT_ROOT = Path.home() / ".eigent"
 SKILL_CONFIG_FILENAME = "skills-config.json"
+
+# Per-path locks so concurrent FastAPI threadpool requests cannot interleave
+# read-modify-write on the same skills-config.json. WeakValueDictionary lets
+# unused locks GC after the last holder releases.
+_PATH_LOCKS: weakref.WeakValueDictionary[str, threading.RLock] = (
+    weakref.WeakValueDictionary()
+)
+_PATH_LOCKS_GUARD = threading.Lock()
+
+
+def _path_lock(path: Path) -> threading.RLock:
+    key = str(path)
+    with _PATH_LOCKS_GUARD:
+        lock = _PATH_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _PATH_LOCKS[key] = lock
+        return lock
+
+
+@contextmanager
+def _locked_config(user_id: str | int):
+    with _path_lock(_config_path(user_id)):
+        yield
+
+
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write `text` to `path` via tmp-file + os.replace."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_name = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w",
+            encoding="utf-8",
+            dir=str(path.parent),
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            delete=False,
+        ) as tmp:
+            tmp.write(text)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+            tmp_name = tmp.name
+        os.replace(tmp_name, path)
+        tmp_name = None
+    finally:
+        if tmp_name is not None:
+            Path(tmp_name).unlink(missing_ok=True)
+
+
+def _atomic_write_json(path: Path, payload: dict) -> None:
+    _atomic_write_text(path, json.dumps(payload, indent=2, ensure_ascii=False))
 
 
 def _sanitize_identity(value: str | int | None) -> str:
@@ -102,24 +159,22 @@ def migrate_legacy_skill_config(
         return dest
 
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if not dest.exists():
-        shutil.move(str(source), str(dest))
-        logger.info("Migrated skills config from %s to %s", source, dest)
-    else:
-        primary = _read_config_file(dest)
-        legacy = _read_config_file(source)
-        dest.write_text(
-            json.dumps(
-                _merge_configs(primary=primary, legacy=legacy),
-                indent=2,
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
-        source.unlink()
-        logger.info(
-            "Merged legacy skills config from %s into %s", source, dest
-        )
+    with _path_lock(dest):
+        if not source.exists():
+            return dest
+        if not dest.exists():
+            shutil.move(str(source), str(dest))
+            logger.info("Migrated skills config from %s to %s", source, dest)
+        else:
+            primary = _read_config_file(dest)
+            legacy = _read_config_file(source)
+            _atomic_write_json(
+                dest, _merge_configs(primary=primary, legacy=legacy)
+            )
+            source.unlink()
+            logger.info(
+                "Merged legacy skills config from %s into %s", source, dest
+            )
 
     try:
         source.parent.rmdir()
@@ -133,17 +188,14 @@ def _load_config(
 ) -> dict:
     path = migrate_legacy_skill_config(user_id, legacy_user_id)
     if not path.exists():
-        path.parent.mkdir(parents=True, exist_ok=True)
         default = {"version": 1, "skills": {}}
-        path.write_text(json.dumps(default, indent=2, ensure_ascii=False))
+        _atomic_write_json(path, default)
         return default
     return _read_config_file(path)
 
 
 def _save_config(user_id: str | int, config: dict) -> None:
-    path = _config_path(user_id)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(config, indent=2, ensure_ascii=False))
+    _atomic_write_json(_config_path(user_id), config)
 
 
 def _ensure_skills_key(config: dict) -> dict:
@@ -156,14 +208,22 @@ def skill_config_load(
     user_id: str | int, legacy_user_id: str | int | None = None
 ) -> dict:
     """Load skills config for user."""
-    config = _load_config(user_id, legacy_user_id)
-    return _ensure_skills_key(config)
+    with _locked_config(user_id):
+        config = _load_config(user_id, legacy_user_id)
+        return _ensure_skills_key(config)
 
 
 def skill_config_init(
     user_id: str | int, legacy_user_id: str | int | None = None
 ) -> dict:
     """Load or create config, merge default from example-skills if present."""
+    with _locked_config(user_id):
+        return _skill_config_init_locked(user_id, legacy_user_id)
+
+
+def _skill_config_init_locked(
+    user_id: str | int, legacy_user_id: str | int | None = None
+) -> dict:
     config = _load_config(user_id, legacy_user_id)
     config = _ensure_skills_key(config)
     changed = False
@@ -223,11 +283,12 @@ def skill_config_update(
     legacy_user_id: str | int | None = None,
 ) -> None:
     """Update config for a skill (merge with existing, don't replace entirely)."""
-    config = _load_config(user_id, legacy_user_id)
-    config = _ensure_skills_key(config)
-    existing = config["skills"].get(skill_name, {})
-    config["skills"][skill_name] = {**existing, **skill_config}
-    _save_config(user_id, config)
+    with _locked_config(user_id):
+        config = _load_config(user_id, legacy_user_id)
+        config = _ensure_skills_key(config)
+        existing = config["skills"].get(skill_name, {})
+        config["skills"][skill_name] = {**existing, **skill_config}
+        _save_config(user_id, config)
 
 
 def skill_config_delete(
@@ -236,11 +297,12 @@ def skill_config_delete(
     legacy_user_id: str | int | None = None,
 ) -> None:
     """Remove skill from config."""
-    config = _load_config(user_id, legacy_user_id)
-    config = _ensure_skills_key(config)
-    if skill_name in config["skills"]:
-        del config["skills"][skill_name]
-        _save_config(user_id, config)
+    with _locked_config(user_id):
+        config = _load_config(user_id, legacy_user_id)
+        config = _ensure_skills_key(config)
+        if skill_name in config["skills"]:
+            del config["skills"][skill_name]
+            _save_config(user_id, config)
 
 
 def skill_config_toggle(
@@ -250,16 +312,17 @@ def skill_config_toggle(
     legacy_user_id: str | int | None = None,
 ) -> dict:
     """Toggle skill enabled state."""
-    config = _load_config(user_id, legacy_user_id)
-    config = _ensure_skills_key(config)
-    if skill_name not in config["skills"]:
-        config["skills"][skill_name] = {
-            "enabled": enabled,
-            "scope": {"isGlobal": True, "selectedAgents": []},
-            "addedAt": int(time.time() * 1000),
-            "isExample": False,
-        }
-    else:
-        config["skills"][skill_name]["enabled"] = enabled
-    _save_config(user_id, config)
-    return config["skills"][skill_name]
+    with _locked_config(user_id):
+        config = _load_config(user_id, legacy_user_id)
+        config = _ensure_skills_key(config)
+        if skill_name not in config["skills"]:
+            config["skills"][skill_name] = {
+                "enabled": enabled,
+                "scope": {"isGlobal": True, "selectedAgents": []},
+                "addedAt": int(time.time() * 1000),
+                "isExample": False,
+            }
+        else:
+            config["skills"][skill_name]["enabled"] = enabled
+        _save_config(user_id, config)
+        return config["skills"][skill_name]
